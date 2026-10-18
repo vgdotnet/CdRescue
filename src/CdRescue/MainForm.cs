@@ -27,10 +27,12 @@ internal sealed class MainForm : Form
     private readonly Button _start = new() { Text = "Начать", AutoSize = true };
     private readonly Button _test = new() { Text = "Проверить диск", AutoSize = true };
     private readonly Button _stop = new() { Text = "Остановить", AutoSize = true, Enabled = false };
+    private readonly Button _report = new() { Text = "Отчёт о повреждениях", AutoSize = true };
     private readonly Label _stage = new() { AutoSize = true, Text = "Выберите привод и файл образа." };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Fill, Maximum = 1000, Height = 18 };
     private readonly Label _stats = new() { AutoSize = true };
     private readonly Label _speedInfo = new() { AutoSize = true };
+    private readonly ToolTip _tips = new();
     private readonly Label _cellInfo = new() { AutoSize = true, Margin = new Padding(12, 3, 3, 3) };
     private readonly SectorMapView _mapView = new() { Dock = DockStyle.Fill, MinimumSize = new Size(200, 120) };
     private readonly TextBox _log = new()
@@ -79,6 +81,7 @@ internal sealed class MainForm : Form
         _browseMap.Click += (_, _) => BrowseMap();
         _start.Click += async (_, _) => await StartAsync();
         _test.Click += async (_, _) => await TestAsync();
+        _report.Click += async (_, _) => await ReportAsync(show: true);
         _stop.Click += (_, _) => Stop();
 
         LoadDrives();
@@ -110,6 +113,7 @@ internal sealed class MainForm : Form
         buttons.Controls.Add(_start);
         buttons.Controls.Add(_test);
         buttons.Controls.Add(_stop);
+        buttons.Controls.Add(_report);
         settings.Controls.Add(new Label());
         settings.Controls.Add(buttons);
         settings.SetColumnSpan(buttons, 2);
@@ -150,17 +154,21 @@ internal sealed class MainForm : Form
     private FlowLayoutPanel Legend()
     {
         var p = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 4, 0, 0) };
-        foreach (var (color, text) in new[]
+        foreach (var (color, text, tip) in new[]
         {
-            (SectorMapView.GoodColor, "прочитано"),
-            (SectorMapView.SkippedColor, "пропущено (дочитается во 2-м проходе)"),
-            (SectorMapView.BadColor, "плохие"),
-            (SectorMapView.PartialColor, "частично (сборка из сырых чтений)"),
-            (SectorMapView.UntriedColor, "не читалось"),
+            (SectorMapView.GoodColor, "прочитано", "Сектор прочитан и записан в образ."),
+            (SectorMapView.SkippedColor, "пропущено", "Быстрый проход перескочил через сбойное место; второй проход дочитает его по секторам."),
+            (SectorMapView.BadColor, "плохие", "Сектор не читается; в образе на его месте нули."),
+            (SectorMapView.PartialColor, "частично", "Сектор собран из сырых чтений, но контрольная сумма не сошлась - возможны ошибки."),
+            (SectorMapView.UntriedColor, "не читалось", "До сектора ещё не дошли."),
         })
         {
-            p.Controls.Add(new Panel { BackColor = color, Size = new Size(12, 12), Margin = new Padding(3, 5, 3, 3) });
-            p.Controls.Add(new Label { Text = text, AutoSize = true, Margin = new Padding(0, 3, 12, 3) });
+            var swatch = new Panel { BackColor = color, Size = new Size(12, 12), Margin = new Padding(3, 5, 3, 3) };
+            var label = new Label { Text = text, AutoSize = true, Margin = new Padding(0, 3, 12, 3) };
+            _tips.SetToolTip(swatch, tip);
+            _tips.SetToolTip(label, tip);
+            p.Controls.Add(swatch);
+            p.Controls.Add(label);
         }
         p.Controls.Add(_cellInfo);
         return p;
@@ -286,7 +294,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        await RunAsync(
+        var result = await RunAsync(
             (mapReady, progress, log, ct) => RescueSession.Run(options, mapReady, progress, log, ct),
             outcome => outcome switch
             {
@@ -294,6 +302,58 @@ internal sealed class MainForm : Form
                 RescueOutcome.Partial => "Готово: часть секторов не прочитана. Можно продолжить позже, в том числе на другом приводе.",
                 _ => "Остановлено. Образ и карта сохранены - нажмите «Начать», чтобы продолжить.",
             });
+
+        // Неполный образ - сразу сказать, задеты ли файлы; подробности по кнопке.
+        if (result == RescueOutcome.Partial && !_closeWhenStopped)
+            await ReportAsync(show: false);
+    }
+
+    /// <summary>Разбирает файловую систему снятого образа и сопоставляет непрочитанные сектора с файлами.</summary>
+    private async Task ReportAsync(bool show)
+    {
+        string image, map;
+        try
+        {
+            image = Path.GetFullPath(_image.Text.Trim());
+            map = _mapPath.Text.Trim().Length > 0 ? Path.GetFullPath(_mapPath.Text.Trim()) : image + ".map";
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            MessageBox.Show(this, $"Неверный путь: {ex.Message}", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!File.Exists(image) || !File.Exists(map))
+        {
+            MessageBox.Show(this, "Отчёт строится по снятому образу и его карте, а их нет:\n"
+                + (File.Exists(image) ? "" : image + "\n") + (File.Exists(map) ? "" : map),
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _report.Enabled = false;
+        try
+        {
+            var report = await Task.Run(() => DamageAnalyzer.Analyze(image, SectorMap.Open(map)));
+            AppendLog("Анализ повреждений: " + report.Verdict);
+            if (!show && report.Files.Count + report.Structures.Count > 0)
+                AppendLog("Список задетых файлов - кнопка «Отчёт о повреждениях».");
+            if (show)
+            {
+                using var form = new ReportForm(report, image);
+                form.ShowDialog(this);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            AppendLog($"Анализ повреждений не удался: {ex.Message}");
+            if (show)
+                MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _report.Enabled = _cts is null;
+        }
     }
 
     private async Task TestAsync()
@@ -318,8 +378,10 @@ internal sealed class MainForm : Form
     private delegate RescueOutcome Job(Action<SectorMap> mapReady, IProgress<RescueProgress> progress,
         Action<string> log, CancellationToken ct);
 
-    private async Task RunAsync(Job job, Func<RescueOutcome, string> stageText)
+    /// <returns>Итог работы; null - ошибка.</returns>
+    private async Task<RescueOutcome?> RunAsync(Job job, Func<RescueOutcome, string> stageText)
     {
+        RescueOutcome? result = null;
         SetRunning(true);
         _cts = new CancellationTokenSource();
         _rateWindow.Clear();
@@ -340,6 +402,7 @@ internal sealed class MainForm : Form
                 ct));
 
             _stage.Text = stageText(outcome);
+            result = outcome;
         }
         catch (DriveAccessException ex)
         {
@@ -363,6 +426,7 @@ internal sealed class MainForm : Form
 
         if (_closeWhenStopped)
             Close();
+        return result;
     }
 
     private void Stop()
@@ -376,6 +440,7 @@ internal sealed class MainForm : Form
     {
         _start.Enabled = !running;
         _test.Enabled = !running;
+        _report.Enabled = !running;
         _stop.Enabled = running;
         foreach (var c in new Control[] { _drive, _refresh, _image, _browseImage, _mapPath, _browseMap, _retries, _speed })
             c.Enabled = !running;
