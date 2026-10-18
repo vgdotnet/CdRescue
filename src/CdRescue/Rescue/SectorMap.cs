@@ -54,6 +54,9 @@ internal sealed class SectorMap
         return new SectorMap(path, s, resumed: false);
     }
 
+    /// <summary>Существующая карта - для анализа уже снятого образа, без привода.</summary>
+    public static SectorMap Open(string path) => new(path, File.ReadAllBytes(path), resumed: true);
+
     /// <summary>Карта только в памяти - для проверки диска, на диск не сохраняется.</summary>
     public static SectorMap CreateTransient(long sectors)
     {
