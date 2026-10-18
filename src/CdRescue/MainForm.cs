@@ -28,6 +28,7 @@ internal sealed class MainForm : Form
     private readonly Button _test = new() { Text = "Проверить диск", AutoSize = true };
     private readonly Button _stop = new() { Text = "Остановить", AutoSize = true, Enabled = false };
     private readonly Button _report = new() { Text = "Отчёт о повреждениях", AutoSize = true };
+    private readonly Button _burn = new() { Text = "Записать на диск…", AutoSize = true };
     private readonly Label _stage = new() { AutoSize = true, Text = "Выберите привод и файл образа." };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Fill, Maximum = 1000, Height = 18 };
     private readonly Label _stats = new() { AutoSize = true };
@@ -83,6 +84,7 @@ internal sealed class MainForm : Form
         _start.Click += async (_, _) => await StartAsync();
         _test.Click += async (_, _) => await TestAsync();
         _report.Click += async (_, _) => await ReportAsync(show: true);
+        _burn.Click += async (_, _) => await BurnAsync();
         _stop.Click += (_, _) => Stop();
 
         LoadDrives();
@@ -115,6 +117,7 @@ internal sealed class MainForm : Form
         buttons.Controls.Add(_test);
         buttons.Controls.Add(_stop);
         buttons.Controls.Add(_report);
+        buttons.Controls.Add(_burn);
         settings.Controls.Add(new Label());
         settings.Controls.Add(buttons);
         settings.SetColumnSpan(buttons, 2);
@@ -371,6 +374,63 @@ internal sealed class MainForm : Form
         }
     }
 
+    /// <summary>
+    /// Запись снятого образа на болванку. Неполный образ - только с предупреждением: на копии
+    /// повреждённые файлы будут читаться без ошибок, и порча станет незаметной.
+    /// </summary>
+    private async Task BurnAsync()
+    {
+        string image, map;
+        try
+        {
+            image = Path.GetFullPath(_image.Text.Trim());
+            map = _mapPath.Text.Trim().Length > 0 ? Path.GetFullPath(_mapPath.Text.Trim()) : image + ".map";
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            MessageBox.Show(this, $"Неверный путь: {ex.Message}", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!File.Exists(image))
+        {
+            MessageBox.Show(this, "Сначала снимите образ: файла нет\n" + image, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string? warning = null;
+        if (!File.Exists(map))
+        {
+            warning = "Карта секторов не найдена - проверить, полный ли образ, нельзя.";
+        }
+        else
+        {
+            _burn.Enabled = false;
+            try
+            {
+                var report = await Task.Run(() =>
+                {
+                    var m = SectorMap.Open(map);
+                    return m.Counts().Good == m.Length ? null : DamageAnalyzer.Analyze(image, m);
+                });
+                if (report is not null)
+                    warning = $"Образ неполный: не прочитано {report.Unreadable:N0} секторов"
+                        + (report.Partial > 0 ? $", частично {report.Partial:N0}" : "") + ".\n" + report.Verdict;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                warning = "Карту прочитать не удалось - полнота образа неизвестна: " + ex.Message;
+            }
+            finally
+            {
+                _burn.Enabled = _cts is null;
+            }
+        }
+
+        using var form = new BurnForm(image, warning);
+        form.ShowDialog(this);
+    }
+
     private async Task TestAsync()
     {
         if (_drive.SelectedItem is not DriveItem drive)
@@ -463,6 +523,7 @@ internal sealed class MainForm : Form
         _start.Enabled = !running;
         _test.Enabled = !running;
         _report.Enabled = !running;
+        _burn.Enabled = !running;
         _stop.Enabled = running;
         foreach (var c in new Control[] { _drive, _refresh, _image, _browseImage, _mapPath, _browseMap, _retries, _speed })
             c.Enabled = !running;
