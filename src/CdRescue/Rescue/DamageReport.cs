@@ -10,6 +10,7 @@ internal sealed record DamagedStructure(string What, IReadOnlyList<long> Lbas, s
 internal sealed class DamageReport
 {
     public string? VolumeLabel { get; init; }
+    public bool FromDrive { get; init; }         // построен после проверки диска, образа нет
     public long TotalSectors { get; init; }
     public long Unreadable { get; init; }        // плохие, пропущенные и не читавшиеся
     public long Partial { get; init; }
@@ -41,10 +42,14 @@ internal sealed class DamageReport
 
             var sb = new StringBuilder();
             if (Files.Count == 0 && Structures.Count == 0)
-                sb.Append("Повреждения только вне файлов - данные не пострадали, образ можно прожигать.");
+                sb.Append(FromDrive
+                    ? "Повреждения только вне файлов - данные не пострадали, снятый образ можно будет прожигать."
+                    : "Повреждения только вне файлов - данные не пострадали, образ можно прожигать.");
             else if (Files.Count > 0)
                 sb.Append($"Повреждено файлов: {Files.Count} из {FilesTotal}. Остальные целы. "
-                    + "Прожиг образа как есть даст копию, где эти файлы читаются без ошибок, но с испорченным содержимым.");
+                    + (FromDrive
+                        ? "Если не дочитать их при снятии образа, на прожжённой копии они будут читаться без ошибок, но с испорченным содержимым."
+                        : "Прожиг образа как есть даст копию, где эти файлы читаются без ошибок, но с испорченным содержимым."));
             if (Structures.Count > 0)
                 sb.Append((sb.Length > 0 ? " " : "") + "Повреждены служебные структуры - список файлов может быть неполным.");
             if (NotTried > 0)
@@ -59,7 +64,7 @@ internal sealed class DamageReport
         sb.AppendLine("Отчёт о повреждениях" + (VolumeLabel is { Length: > 0 } ? $" - том «{VolumeLabel}»" : ""));
         sb.AppendLine(Verdict);
         sb.AppendLine();
-        sb.AppendLine($"Секторов в образе: {TotalSectors:N0}");
+        sb.AppendLine($"Секторов {(FromDrive ? "на диске" : "в образе")}: {TotalSectors:N0}");
         sb.AppendLine($"Не прочитано: {Unreadable:N0}" + (NotTried > 0 ? $" (из них не читались вовсе: {NotTried:N0})" : ""));
         if (Partial > 0)
             sb.AppendLine($"Восстановлено частично: {Partial:N0}");
@@ -148,21 +153,42 @@ internal static class DamageAnalyzer
 
     private readonly record struct Extent(long Start, long Count, Owner Owner, long FileOffset);
 
+    /// <summary>По снятому образу.</summary>
     public static DamageReport Analyze(string imagePath, SectorMap map)
     {
         using var img = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return Analyze(map, lba =>
+        {
+            if ((lba + 1) * S > img.Length)
+                return null;
+            var sec = new byte[S];
+            img.Position = lba * S;
+            img.ReadExactly(sec);
+            return sec;
+        });
+    }
+
+    /// <summary>
+    /// По любому источнику секторов - образу или самому приводу после проверки диска.
+    /// readSector вызывается только для секторов, которые карта отмечает прочитанными;
+    /// null - сектор сейчас не прочитался.
+    /// </summary>
+    public static DamageReport Analyze(SectorMap map, Func<long, byte[]?> readSector, bool fromDrive = false)
+    {
         var extents = new List<Extent>();
         var files = new Dictionary<(long Lba, long Size), IsoFile>();
         var notes = new List<string>();
-        var buf = new byte[S];
+
+        var rereadFailed = new List<long>();
 
         byte[]? Read(long lba)
         {
-            if (lba < 0 || lba >= map.Length || map[lba] != SectorMap.Good || (lba + 1) * S > img.Length)
+            if (lba < 0 || lba >= map.Length || map[lba] != SectorMap.Good)
                 return null;
-            img.Position = lba * S;
-            img.ReadExactly(buf);
-            return (byte[])buf.Clone();
+            var sec = readSector(lba);
+            if (sec is null)
+                rereadFailed.Add(lba); // по карте прочитан, а сейчас нет - пограничный сектор
+            return sec;
         }
 
         // Дескрипторы тома: с сектора 16 до терминатора.
@@ -216,6 +242,10 @@ internal static class DamageAnalyzer
             AddPathTables(desc, tree, extents);
             WalkTree(desc, isJoliet, tree, Read, extents, files);
         }
+
+        if (rereadFailed.Count > 0)
+            notes.Add($"Служебные сектора {string.Join(", ", rereadFailed.Take(10))}{(rereadFailed.Count > 10 ? ", ..." : "")} "
+                + "раньше читались, а при анализе - нет; список файлов может быть неполным.");
 
         // Кому принадлежит каждый сектор; при пересечении - первому записанному.
         var owner = new int[map.Length];
@@ -284,6 +314,7 @@ internal static class DamageAnalyzer
         return new DamageReport
         {
             VolumeLabel = label,
+            FromDrive = fromDrive,
             TotalSectors = map.Length,
             Unreadable = unreadable,
             Partial = partial,

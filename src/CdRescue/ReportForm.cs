@@ -6,14 +6,16 @@ namespace CdRescue;
 internal sealed class ReportForm : Form
 {
     private readonly DamageReport _report;
-    private readonly string _imagePath;
+    private readonly string _savePath;
 
-    public ReportForm(DamageReport report, string imagePath)
+    /// <param name="source">Откуда отчёт - имя образа или привод; идёт в заголовок окна.</param>
+    /// <param name="savePath">Предлагаемый файл для сохранения.</param>
+    public ReportForm(DamageReport report, string source, string savePath)
     {
         _report = report;
-        _imagePath = imagePath;
+        _savePath = savePath;
 
-        Text = "Отчёт о повреждениях - " + Path.GetFileName(imagePath);
+        Text = "Отчёт о повреждениях - " + source;
         StartPosition = FormStartPosition.CenterParent;
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(820, 560);
@@ -102,8 +104,8 @@ internal sealed class ReportForm : Form
         {
             Title = "Сохранить отчёт",
             Filter = "Текст (*.txt)|*.txt",
-            FileName = Path.GetFileNameWithoutExtension(_imagePath) + " - отчёт о повреждениях.txt",
-            InitialDirectory = Path.GetDirectoryName(_imagePath) ?? "",
+            FileName = Path.GetFileName(_savePath),
+            InitialDirectory = Path.GetDirectoryName(_savePath) is { } dir && Directory.Exists(dir) ? dir : "",
         };
         if (dlg.ShowDialog(this) == DialogResult.OK)
             File.WriteAllText(dlg.FileName, _report.ToText().ReplaceLineEndings("\r\n") + "\r\n", new System.Text.UTF8Encoding(true));

@@ -93,6 +93,20 @@ internal sealed unsafe class CdDrive : IDisposable
         return Exec(cdb, buf, (uint)count * Rescuer.SectorSize);
     }
 
+    /// <summary>Один сектор в новый массив - для редких чтений вроде служебных структур; null - не прочитался.</summary>
+    public byte[]? ReadSector(long lba)
+    {
+        byte* b = (byte*)NativeMemory.AlignedAlloc(Rescuer.SectorSize, 4096);
+        try
+        {
+            return Read10((uint)lba, 1, b, fua: true).Ok ? new ReadOnlySpan<byte>(b, Rescuer.SectorSize).ToArray() : null;
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(b);
+        }
+    }
+
     /// <summary>
     /// READ CD одного сектора целиком (2352 байта) и следом блок C2 (294 байта): установленный бит
     /// значит, что соответствующий байт привод исправить не смог. Нужен буфер на RawSectorSize + C2Size.

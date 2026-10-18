@@ -36,8 +36,9 @@ internal static class RescueSession
     /// Проверка диска: те же быстрый проход и доочистка, что при снятии образа, но без записи.
     /// Каждый сектор либо прочитан, либо отмечен плохим после отдельной попытки - карта точная.
     /// </summary>
+    /// <param name="reportReady">Отчёт о повреждениях, если проверка дошла до конца и нашла нечитаемые сектора.</param>
     public static RescueOutcome Test(char drive, int speedKBps, Action<SectorMap> mapReady,
-        IProgress<RescueProgress> progress, Action<string> log, CancellationToken ct)
+        IProgress<RescueProgress> progress, Action<string> log, Action<DamageReport> reportReady, CancellationToken ct)
     {
         using var cd = new CdDrive(drive);
         var (sectors, blockLen) = cd.ReadCapacity();
@@ -61,7 +62,14 @@ internal static class RescueSession
 
             if (ct.IsCancellationRequested)
                 return RescueOutcome.Cancelled;
-            return map.Counts().Good == sectors ? RescueOutcome.Complete : RescueOutcome.Partial;
+            if (map.Counts().Good == sectors)
+                return RescueOutcome.Complete;
+
+            // Образа нет - служебные сектора (каталоги, дескрипторы) читаем с привода, их немного.
+            var report = DamageAnalyzer.Analyze(map, cd.ReadSector, fromDrive: true);
+            log("Анализ повреждений: " + report.Verdict);
+            reportReady(report);
+            return RescueOutcome.Partial;
         }
         finally
         {

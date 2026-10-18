@@ -42,6 +42,7 @@ internal sealed class MainForm : Form
     };
 
     private CancellationTokenSource? _cts;
+    private (DamageReport Report, char Drive)? _checkReport;   // отчёт последней проверки диска, без образа
     private bool _closeWhenStopped;
     private bool _mapEdited;
     // Скорость считаем по окну ~3 с: за один тик в 0,5 с значения слишком скачут.
@@ -308,9 +309,22 @@ internal sealed class MainForm : Form
             await ReportAsync(show: false);
     }
 
-    /// <summary>Разбирает файловую систему снятого образа и сопоставляет непрочитанные сектора с файлами.</summary>
+    /// <summary>
+    /// Разбирает файловую систему снятого образа и сопоставляет непрочитанные сектора с файлами.
+    /// Если последней была проверка диска - показывает её отчёт, построенный по приводу.
+    /// </summary>
     private async Task ReportAsync(bool show)
     {
+        if (show && _checkReport is { } check)
+        {
+            string label = check.Report.VolumeLabel is { Length: > 0 } l ? l : "disk";
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "CdRescue");
+            using var form = new ReportForm(check.Report, $"проверка диска {check.Drive}:",
+                Path.Combine(dir, $"{string.Concat(label.Split(Path.GetInvalidFileNameChars()))} - отчёт о повреждениях.txt"));
+            form.ShowDialog(this);
+            return;
+        }
+
         string image, map;
         try
         {
@@ -340,7 +354,8 @@ internal sealed class MainForm : Form
                 AppendLog("Список задетых файлов - кнопка «Отчёт о повреждениях».");
             if (show)
             {
-                using var form = new ReportForm(report, image);
+                using var form = new ReportForm(report, Path.GetFileName(image),
+                    Path.Combine(Path.GetDirectoryName(image) ?? "", Path.GetFileNameWithoutExtension(image) + " - отчёт о повреждениях.txt"));
                 form.ShowDialog(this);
             }
         }
@@ -366,7 +381,13 @@ internal sealed class MainForm : Form
 
         int speed = ((SpeedItem)_speed.SelectedItem!).KBps;
         await RunAsync(
-            (mapReady, progress, log, ct) => RescueSession.Test(drive.Letter, speed, mapReady, progress, log, ct),
+            (mapReady, progress, log, ct) => RescueSession.Test(drive.Letter, speed, mapReady, progress, log,
+                report => BeginInvoke(() =>
+                {
+                    _checkReport = (report, drive.Letter);
+                    AppendLog("Список задетых файлов - кнопка «Отчёт о повреждениях».");
+                }),
+                ct),
             outcome => outcome switch
             {
                 RescueOutcome.Complete => "Проверка: все сектора читаются.",
@@ -388,6 +409,7 @@ internal sealed class MainForm : Form
         _rateClock.Restart();
         _speedInfo.Text = "";
         _mapView.Map = null;
+        _checkReport = null;
         _log.Clear();
 
         var progress = new Progress<RescueProgress>(ShowProgress);
