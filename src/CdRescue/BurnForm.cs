@@ -35,6 +35,12 @@ internal sealed class BurnForm : Form
     private MediaInfo? _info;
     private CancellationTokenSource? _cts;
 
+    // Этап и время последнего события: если служба молчит, окно всё равно показывает, что работа идёт.
+    private readonly System.Windows.Forms.Timer _ticker = new() { Interval = 1000 };
+    private string _phase = "";
+    private DateTime _phaseStart;
+    private DateTime _lastEvent;
+
     /// <param name="warning">Предупреждение о неполном образе - показывается перед записью.</param>
     public BurnForm(string isoPath, string? warning)
     {
@@ -130,10 +136,19 @@ internal sealed class BurnForm : Form
             _stage.Text = "Отмена…";
         };
         Shown += async (_, _) => await LoadRecordersAsync();
+        _ticker.Tick += (_, _) =>
+        {
+            if (_phase.Length > 0 && DateTime.Now - _lastEvent > TimeSpan.FromSeconds(3))
+                _stage.Text = $"{_phase} - идёт {DateTime.Now - _phaseStart:mm\\:ss}, привод не сообщает прогресс";
+        };
     }
 
     private static Label Caption(string text) =>
         new() { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) };
+
+    private static string Cancelled(MediaInfo info) =>
+        "Запись отменена: на диске только часть образа, пользоваться им нельзя."
+        + (info.NeedsErase || info.Overwrite || info.Type.Contains("RW") ? " Диск можно стереть и записать заново." : "");
 
     private long ImageSectors => new FileInfo(_isoPath).Length / Rescuer.SectorSize;
 
@@ -245,10 +260,10 @@ internal sealed class BurnForm : Form
             {
                 // Стирание не отменяется - кнопку отмены включим к началу записи.
                 _cancel.Enabled = false;
-                _stage.Text = full ? "Полное стирание…" : "Быстрое стирание…";
-                Log(_stage.Text);
+                Phase(full ? "Полное стирание" : "Быстрое стирание");
                 await Task.Run(() => Imapi.Erase(rec.Id, full, (elapsed, total) => BeginInvoke(() =>
                 {
+                    _lastEvent = DateTime.Now;
                     _progress.Value = total > 0 ? Math.Clamp(1000 * elapsed / total, 0, 1000) : 0;
                     _stage.Text = $"{(full ? "Полное" : "Быстрое")} стирание: {elapsed} из ~{total} с";
                 })));
@@ -265,9 +280,11 @@ internal sealed class BurnForm : Form
                 _cancel.Enabled = true;
             }
 
+            Phase("Запись");
             string lastAction = "";
-            await Task.Run(() => Imapi.Burn(rec.Id, _isoPath, speed, p => BeginInvoke(() =>
+            var (events, sinkError) = await Task.Run(() => Imapi.Burn(rec.Id, _isoPath, speed, p => BeginInvoke(() =>
             {
+                _lastEvent = DateTime.Now;
                 if (p.Action != lastAction)
                 {
                     Log(p.Action);
@@ -278,10 +295,11 @@ internal sealed class BurnForm : Form
                     : p.Action;
                 _progress.Value = p.Total > 0 ? (int)Math.Clamp(1000 * p.Written / p.Total, 0, 1000) : 0;
             }), ct));
+            Log($"Событий прогресса от службы записи: {events}" + (sinkError is null ? "" : $", ошибка их разбора: {sinkError}"));
 
             if (ct.IsCancellationRequested)
             {
-                _stage.Text = "Запись отменена. Диск, скорее всего, испорчен.";
+                _stage.Text = Cancelled(info);
                 Log(_stage.Text);
                 return;
             }
@@ -289,9 +307,10 @@ internal sealed class BurnForm : Form
 
             if (_verify.Checked && rec.Letter is char letter)
             {
-                _stage.Text = "Сверка с образом…";
+                Phase("Сверка с образом");
                 var result = await Task.Run(() => BurnVerifier.Verify(letter, _isoPath, (done, total) => BeginInvoke(() =>
                 {
+                    _lastEvent = DateTime.Now;
                     _progress.Value = (int)(1000 * done / Math.Max(1, total));
                     _stage.Text = $"Сверка с образом: {done * Rescuer.SectorSize / 1048576.0:N0} из {total * Rescuer.SectorSize / 1048576.0:N0} МБ";
                 }), ct));
@@ -305,6 +324,12 @@ internal sealed class BurnForm : Form
             {
                 _stage.Text = "Готово: диск записан.";
             }
+        }
+        catch (COMException) when (ct.IsCancellationRequested)
+        {
+            // Отменили мы - служба отвечает «request was cancelled»; это не ошибка записи.
+            _stage.Text = Cancelled(info);
+            Log(_stage.Text);
         }
         catch (Exception ex) when (ex is COMException or InvalidOperationException or IOException or DriveAccessException)
         {
@@ -321,8 +346,23 @@ internal sealed class BurnForm : Form
         }
     }
 
+    private void Phase(string name)
+    {
+        _phase = name;
+        _phaseStart = _lastEvent = DateTime.Now;
+        _stage.Text = name;
+        Log(name);
+    }
+
     private void SetBusy(bool busy)
     {
+        if (busy)
+            _ticker.Start();
+        else
+        {
+            _ticker.Stop();
+            _phase = "";
+        }
         _burn.Enabled = !busy;
         _cancel.Enabled = busy;
         _close.Enabled = !busy;

@@ -8,7 +8,7 @@ internal readonly record struct VerifyResult(long Sectors, long Mismatched, long
     public bool Ok => Mismatched == 0 && Unreadable == 0;
 }
 
-/// <summary>Сверяет записанный диск с образом посекторно, читая мимо кэша привода.</summary>
+/// <summary>Сверяет записанный диск с образом посекторно; сбойные места перечитывает мимо кэша привода.</summary>
 internal static unsafe class BurnVerifier
 {
     private const int S = Rescuer.SectorSize;
@@ -36,11 +36,21 @@ internal static unsafe class BurnVerifier
                 iso.Position = lba * S;
                 iso.ReadExactly(file, 0, n * S);
 
-                if (cd.Read10((uint)lba, (ushort)n, disc, fua: true).Ok)
+                // Блоки - обычным чтением: кэш привода - несколько мегабайт, а сверяем сотни; с FUA
+                // привод ждёт оборот диска на каждую команду, и сверка идёт в разы дольше.
+                if (cd.Read10((uint)lba, (ushort)n, disc).Ok)
                 {
                     for (int k = 0; k < n; k++)
-                        if (!new ReadOnlySpan<byte>(disc + k * S, S).SequenceEqual(file.AsSpan(k * S, S)))
+                    {
+                        if (new ReadOnlySpan<byte>(disc + k * S, S).SequenceEqual(file.AsSpan(k * S, S)))
+                            continue;
+                        // Не совпало - перечитать с поверхности, мимо кэша: вдруг привод отдал старые данные.
+                        byte* one = disc + k * S;
+                        if (!cd.Read10((uint)(lba + k), 1, one, fua: true).Ok)
+                            Bad(ref unreadable, lba + k);
+                        else if (!new ReadOnlySpan<byte>(one, S).SequenceEqual(file.AsSpan(k * S, S)))
                             Bad(ref mismatched, lba + k);
+                    }
                 }
                 else
                 {

@@ -3,6 +3,80 @@ using System.Runtime.InteropServices.ComTypes;
 
 namespace CdRescue.Burn;
 
+// События IMAPI2 - dispinterface. Проверено на IMAPI2FS: служба зовёт IDispatch::Invoke, и доходит вызов
+// только до публичного интерфейса [InterfaceIsIDispatch] с DispId; вложенный во внутренний класс
+// интерфейс COM не видит, а интерфейс с таблицей IDispatch вручную вызовов не получает.
+
+[ComImport, Guid("2735413C-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+public interface DDiscFormat2DataEvents
+{
+    [DispId(0x200)]
+    void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, [MarshalAs(UnmanagedType.IDispatch)] object progress);
+}
+
+[ComImport, Guid("2735413A-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+public interface DDiscFormat2EraseEvents
+{
+    [DispId(0x200)]
+    void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, int elapsedSeconds, int estimatedTotalSeconds);
+}
+
+/// <summary>Приёмник событий записи. Ошибку разбора не отдаём службе - копим для журнала.</summary>
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class DataEventsSink : DDiscFormat2DataEvents
+{
+    private readonly Action<BurnProgress> _report;
+
+    internal DataEventsSink(Action<BurnProgress> report) => _report = report;
+
+    public int Events { get; private set; }
+    public string? FirstError { get; private set; }
+
+    public void Update(object sender, object progress)
+    {
+        Events++;
+        try
+        {
+            int action = Convert.ToInt32(Get(progress, "CurrentAction"));
+            long start = Convert.ToInt64(Get(progress, "StartLba"));
+            long count = Convert.ToInt64(Get(progress, "SectorCount"));
+            long last = Convert.ToInt64(Get(progress, "LastWrittenLba"));
+            int remaining = Convert.ToInt32(Get(progress, "RemainingTime"));
+            _report(new BurnProgress(Imapi.ActionName(action), Math.Clamp(last - start, 0, count), count, remaining));
+        }
+        catch (Exception ex)
+        {
+            FirstError ??= $"{ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    internal static object? Get(object com, string property) =>
+        com.GetType().InvokeMember(property, System.Reflection.BindingFlags.GetProperty, null, com, null);
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class EraseEventsSink : DDiscFormat2EraseEvents
+{
+    private readonly Action<int, int> _report;
+
+    internal EraseEventsSink(Action<int, int> report) => _report = report;
+
+    public int Events { get; private set; }
+
+    public void Update(object sender, int elapsedSeconds, int estimatedTotalSeconds)
+    {
+        Events++;
+        try
+        {
+            _report(elapsedSeconds, estimatedTotalSeconds);
+        }
+        catch (Exception)
+        {
+            // Прогресс стирания - не повод его прерывать.
+        }
+    }
+}
+
 internal sealed record RecorderInfo(string Id, string Name, string Letters)
 {
     public override string ToString() => $"{Letters}  {Name}";
@@ -167,9 +241,11 @@ internal static class Imapi
     /// CD-RW и DVD-RW перед этим нужно стереть. Блокирует поток до конца записи.
     /// </summary>
     /// <param name="sectorsPerSecond">0 - максимальная скорость.</param>
-    public static void Burn(string recorderId, string isoPath, int sectorsPerSecond,
+    /// <returns>Сколько событий прогресса пришло и первая ошибка их разбора - для журнала.</returns>
+    public static (int Events, string? FirstError) Burn(string recorderId, string isoPath, int sectorsPerSecond,
         Action<BurnProgress> progress, CancellationToken ct)
     {
+        var sink = new DataEventsSink(progress);
         dynamic rec = Create("IMAPI2.MsftDiscRecorder2");
         dynamic fmt = Create("IMAPI2.MsftDiscFormat2Data");
         IStream? stream = null;
@@ -185,7 +261,6 @@ internal static class Imapi
 
             SHCreateStreamOnFileEx(isoPath, StgmRead | StgmShareDenyWrite, 0, false, IntPtr.Zero, out stream);
 
-            var sink = new ProgressSink(progress);
             var container = (IConnectionPointContainer)(object)fmt;
             var iid = typeof(DDiscFormat2DataEvents).GUID;
             container.FindConnectionPoint(ref iid, out var point);
@@ -208,6 +283,7 @@ internal static class Imapi
             }).Wait());
 
             fmt.Write(stream);
+            return (sink.Events, sink.FirstError);
         }
         finally
         {
@@ -260,7 +336,7 @@ internal static class Imapi
             container.FindConnectionPoint(ref iid, out var point);
             if (point is not null)
             {
-                point.Advise(new EraseSink(progress), out cookie);
+                point.Advise(new EraseEventsSink(progress), out cookie);
                 cp = point;
             }
 
@@ -291,53 +367,6 @@ internal static class Imapi
     private static extern void SHCreateStreamOnFileEx(string file, uint mode, uint attributes, bool create,
         IntPtr template, out IStream stream);
 
-    /// <summary>События записи IMAPI2 - dispinterface, вызов приходит через IDispatch::Invoke.</summary>
-    [ComImport, Guid("2735413C-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
-    internal interface DDiscFormat2DataEvents
-    {
-        [DispId(0x200)]
-        void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, [MarshalAs(UnmanagedType.IDispatch)] object args);
-    }
-
-    /// <summary>События стирания: прошло секунд и ожидаемая длительность.</summary>
-    [ComImport, Guid("2735413A-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
-    internal interface DDiscFormat2EraseEvents
-    {
-        [DispId(0x200)]
-        void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, int elapsedSeconds, int estimatedTotalSeconds);
-    }
-
-    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
-    private sealed class EraseSink(Action<int, int> report) : DDiscFormat2EraseEvents
-    {
-        public void Update(object sender, int elapsedSeconds, int estimatedTotalSeconds) =>
-            report(elapsedSeconds, estimatedTotalSeconds);
-    }
-
-    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
-    private sealed class ProgressSink(Action<BurnProgress> report) : DDiscFormat2DataEvents
-    {
-        public void Update(object sender, object args)
-        {
-            try
-            {
-                dynamic a = args;
-                int action = (int)a.CurrentAction;
-                long start = (int)a.StartLba;
-                long count = (int)a.SectorCount;
-                long written = Math.Max(0, (int)a.LastWrittenLba - start);
-                report(new BurnProgress(
-                    action >= 0 && action < Actions.Length ? Actions[action] : $"этап {action}",
-                    Math.Min(written, count), count, (int)a.RemainingTime));
-            }
-            catch (Exception ex) when (ex is COMException or InvalidCastException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
-            {
-                // Прогресс - не повод прерывать запись.
-            }
-            finally
-            {
-                Marshal.ReleaseComObject(args);
-            }
-        }
-    }
+    internal static string ActionName(int action) =>
+        action >= 0 && action < Actions.Length ? Actions[action] : $"этап {action}";
 }
