@@ -116,6 +116,11 @@ internal static class Imapi
                 _ => 676,                       // DVD
             };
 
+            // Закрытый CD-RW/DVD-RW модуль записи данных не принимает, пока диск не стёрт, -
+            // а модуль стирания его поддерживает. Ёмкость такой диск до стирания не сообщает (0).
+            if (!(bool)fmt.IsCurrentMediaSupported(rec) && type is 3 or 10 && CanErase(rec))
+                return new MediaInfo(typeName, true, false, false, 0, per1x, [], "", NeedsErase: true);
+
             if (!(bool)fmt.IsCurrentMediaSupported(rec))
                 return new MediaInfo(typeName, false, false, false, 0, per1x, [], type is 1 or 4 or 17
                     ? "диск только для чтения - вставьте чистую болванку"
@@ -212,6 +217,23 @@ internal static class Imapi
                 Marshal.ReleaseComObject(stream);
             Release(fmt);
             Release(rec);
+        }
+    }
+
+    private static bool CanErase(dynamic rec)
+    {
+        dynamic erase = Create("IMAPI2.MsftDiscFormat2Erase");
+        try
+        {
+            return (bool)erase.IsRecorderSupported(rec) && (bool)erase.IsCurrentMediaSupported(rec);
+        }
+        catch (COMException)
+        {
+            return false;
+        }
+        finally
+        {
+            Release(erase);
         }
     }
 

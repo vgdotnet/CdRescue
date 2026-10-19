@@ -18,7 +18,7 @@ internal sealed class BurnForm : Form
     private readonly Button _refresh = new() { Text = "Обновить", AutoSize = true };
     private readonly Label _media = new() { AutoSize = true, Text = "…" };
     private readonly ComboBox _speed = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
-    private readonly ComboBox _erase = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 420 };
+    private readonly ComboBox _erase = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly Label _eraseCaption = new() { Text = "Стирание:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) };
     private readonly CheckBox _verify = new() { Text = "Сверить диск с образом после записи", AutoSize = true, Checked = true };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Fill, Maximum = 1000, Height = 18 };
@@ -53,21 +53,29 @@ internal sealed class BurnForm : Form
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        grid.Controls.Add(Caption("Образ:"));
-        var image = new Label { AutoSize = true, Text = $"{isoPath}  ({sectors * Rescuer.SectorSize / 1048576.0:N1} МБ)", Margin = new Padding(3, 7, 3, 3) };
-        grid.Controls.Add(image);
-        grid.SetColumnSpan(image, 2);
+        // Ячейки задаём явно: строка стирания показывается не всегда, а скрытые элементы
+        // при автораскладке сдвигают соседей.
+        int row = 0;
+        void Row(Control caption, Control field, Control? extra = null)
+        {
+            grid.Controls.Add(caption, 0, row);
+            grid.Controls.Add(field, 1, row);
+            if (extra is not null)
+                grid.Controls.Add(extra, 2, row);
+            else
+                grid.SetColumnSpan(field, 2);
+            row++;
+        }
 
-        grid.Controls.Add(Caption("Привод:"));
-        grid.Controls.Add(_recorder);
-        grid.Controls.Add(_refresh);
+        Row(Caption("Образ:"), new Label
+        {
+            AutoSize = true, Text = $"{isoPath}  ({sectors * Rescuer.SectorSize / 1048576.0:N1} МБ)", Margin = new Padding(3, 7, 3, 3),
+        });
+        Row(Caption("Привод:"), _recorder, _refresh);
 
-        grid.Controls.Add(Caption("Диск:"));
         _media.Margin = new Padding(3, 7, 3, 3);
-        grid.Controls.Add(_media);
-        grid.SetColumnSpan(_media, 2);
+        Row(Caption("Диск:"), _media);
 
-        grid.Controls.Add(Caption("Скорость:"));
         var speedRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
         speedRow.Controls.Add(_speed);
         speedRow.Controls.Add(new Label
@@ -75,33 +83,25 @@ internal sealed class BurnForm : Form
             AutoSize = true, Margin = new Padding(8, 7, 3, 3), ForeColor = SystemColors.GrayText,
             Text = "медленнее - надёжнее",
         });
-        grid.Controls.Add(speedRow);
-        grid.SetColumnSpan(speedRow, 2);
+        Row(Caption("Скорость:"), speedRow);
 
         _erase.Items.AddRange([
             "быстрое - удаляется оглавление, около минуты",
             "полное - перезаписывается вся поверхность, десятки минут",
         ]);
         _erase.SelectedIndex = 0;
-        grid.Controls.Add(_eraseCaption);
-        grid.Controls.Add(_erase);
-        grid.SetColumnSpan(_erase, 2);
+        Row(_eraseCaption, _erase);
         ShowErase(false);
 
-        grid.Controls.Add(new Label());
-        grid.Controls.Add(_verify);
-        grid.SetColumnSpan(_verify, 2);
+        Row(new Label(), _verify);
 
         if (warning is not null)
         {
-            var warn = new Label
+            Row(new Label(), new Label
             {
                 AutoSize = true, MaximumSize = new Size(LogicalToDeviceUnits(660), 0), Margin = new Padding(3, 8, 3, 3),
                 ForeColor = Color.FromArgb(170, 60, 0), Text = warning,
-            };
-            grid.Controls.Add(new Label());
-            grid.Controls.Add(warn);
-            grid.SetColumnSpan(warn, 2);
+            });
         }
 
         var status = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(8, 0, 8, 4) };
@@ -193,7 +193,7 @@ internal sealed class BurnForm : Form
 
         var m = _info;
         long need = ImageSectors;
-        string size = $"{m.FreeSectors * Rescuer.SectorSize / 1048576.0:N0} МБ";
+        string size = m.FreeSectors > 0 ? $"{m.FreeSectors * Rescuer.SectorSize / 1048576.0:N0} МБ" : "станет известна после стирания";
         string content = m.DestroysData ? DiscContent(rec.Letter) : "";
         _media.Text = m.Problem.Length > 0 ? (m.Type.Length > 0 ? m.Type + ": " : "") + m.Problem
             : m.NeedsErase ? $"{m.Type} с данными{content} - перед записью будет стёрт; ёмкость {size}"
@@ -253,6 +253,15 @@ internal sealed class BurnForm : Form
                     _stage.Text = $"{(full ? "Полное" : "Быстрое")} стирание: {elapsed} из ~{total} с";
                 })));
                 Log("Диск стёрт.");
+
+                // До стирания закрытый RW ёмкость не сообщает - проверяем сейчас, пока ничего не записано.
+                var after = await Task.Run(() => Imapi.Inspect(rec.Id));
+                if (after.FreeSectors > 0 && after.FreeSectors < ImageSectors)
+                    throw new InvalidOperationException(
+                        $"Образ не помещается: на диске {after.FreeSectors * Rescuer.SectorSize / 1048576.0:N0} МБ, "
+                        + $"нужно {ImageSectors * Rescuer.SectorSize / 1048576.0:N0} МБ. Диск стёрт, запись не начиналась.");
+                if (!after.CanBurn)
+                    throw new InvalidOperationException($"После стирания диск не готов к записи: {after.Problem}");
                 _cancel.Enabled = true;
             }
 
