@@ -4,7 +4,7 @@ using CdRescue.Rescue;
 
 namespace CdRescue;
 
-/// <summary>Запись образа на чистый диск с последующей сверкой.</summary>
+/// <summary>Запись образа на чистый или перезаписываемый диск (со стиранием) и сверка.</summary>
 internal sealed class BurnForm : Form
 {
     private sealed record SpeedItem(int SectorsPerSecond, string Text)
@@ -18,6 +18,8 @@ internal sealed class BurnForm : Form
     private readonly Button _refresh = new() { Text = "Обновить", AutoSize = true };
     private readonly Label _media = new() { AutoSize = true, Text = "…" };
     private readonly ComboBox _speed = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
+    private readonly ComboBox _erase = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 420 };
+    private readonly Label _eraseCaption = new() { Text = "Стирание:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) };
     private readonly CheckBox _verify = new() { Text = "Сверить диск с образом после записи", AutoSize = true, Checked = true };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Fill, Maximum = 1000, Height = 18 };
     private readonly Label _stage = new() { AutoSize = true };
@@ -76,6 +78,16 @@ internal sealed class BurnForm : Form
         grid.Controls.Add(speedRow);
         grid.SetColumnSpan(speedRow, 2);
 
+        _erase.Items.AddRange([
+            "быстрое - удаляется оглавление, около минуты",
+            "полное - перезаписывается вся поверхность, десятки минут",
+        ]);
+        _erase.SelectedIndex = 0;
+        grid.Controls.Add(_eraseCaption);
+        grid.Controls.Add(_erase);
+        grid.SetColumnSpan(_erase, 2);
+        ShowErase(false);
+
         grid.Controls.Add(new Label());
         grid.Controls.Add(_verify);
         grid.SetColumnSpan(_verify, 2);
@@ -125,6 +137,22 @@ internal sealed class BurnForm : Form
 
     private long ImageSectors => new FileInfo(_isoPath).Length / Rescuer.SectorSize;
 
+    private void ShowErase(bool show) => _eraseCaption.Visible = _erase.Visible = show;
+
+    /// <summary>Что сейчас записано на диске - чтобы не стереть не тот диск.</summary>
+    private static string DiscContent(char? letter)
+    {
+        try
+        {
+            if (letter is char l && new DriveInfo(l + ":") is { IsReady: true } d)
+                return $" «{d.VolumeLabel}», {d.TotalSize / 1048576.0:N0} МБ";
+        }
+        catch (IOException)
+        {
+        }
+        return "";
+    }
+
     private async Task LoadRecordersAsync()
     {
         _recorder.Items.Clear();
@@ -165,10 +193,14 @@ internal sealed class BurnForm : Form
 
         var m = _info;
         long need = ImageSectors;
-        string free = m.FreeSectors > 0 ? $", свободно {m.FreeSectors * Rescuer.SectorSize / 1048576.0:N0} МБ" : "";
-        _media.Text = m.Problem.Length > 0
-            ? (m.Type.Length > 0 ? m.Type + ": " : "") + m.Problem
-            : $"{m.Type}, пустой{free}";
+        string size = $"{m.FreeSectors * Rescuer.SectorSize / 1048576.0:N0} МБ";
+        string content = m.DestroysData ? DiscContent(rec.Letter) : "";
+        _media.Text = m.Problem.Length > 0 ? (m.Type.Length > 0 ? m.Type + ": " : "") + m.Problem
+            : m.NeedsErase ? $"{m.Type} с данными{content} - перед записью будет стёрт; ёмкость {size}"
+            : m.Overwrite ? $"{m.Type} с данными{content} - запись пойдёт поверх них; ёмкость {size}"
+            : $"{m.Type}, пустой, свободно {size}";
+        _media.ForeColor = m.DestroysData ? Color.FromArgb(170, 60, 0) : SystemColors.ControlText;
+        ShowErase(m.NeedsErase);
         if (m.CanBurn && m.FreeSectors > 0 && m.FreeSectors < need)
             _media.Text += $" - образ не поместится (нужно {need * Rescuer.SectorSize / 1048576.0:N0} МБ)";
 
@@ -187,11 +219,18 @@ internal sealed class BurnForm : Form
         if (_recorder.SelectedItem is not RecorderInfo rec || _info is null)
             return;
 
-        string question = $"Записать образ на {_info.Type} в приводе {rec.Letters}?\n\nДиск будет закрыт - дописать на него потом нельзя.";
+        var info = _info;
+        bool full = _erase.SelectedIndex == 1;
+        string question = $"Записать образ на {info.Type} в приводе {rec.Letters}?\n\nДиск будет закрыт - дописать на него потом нельзя.";
+        if (info.DestroysData)
+            question = $"Все данные на диске{DiscContent(rec.Letter)} будут удалены без возможности восстановления"
+                + (info.NeedsErase ? $" ({(full ? "полное" : "быстрое")} стирание, прервать его нельзя)." : ".")
+                + "\n\n" + question;
         if (_warning is not null)
             question = _warning + "\n\n" + question;
         if (MessageBox.Show(this, question, Text, MessageBoxButtons.YesNo,
-                _warning is null ? MessageBoxIcon.Question : MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                _warning is null && !info.DestroysData ? MessageBoxIcon.Question : MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
 
         SetBusy(true);
@@ -202,6 +241,21 @@ internal sealed class BurnForm : Form
 
         try
         {
+            if (info.NeedsErase)
+            {
+                // Стирание не отменяется - кнопку отмены включим к началу записи.
+                _cancel.Enabled = false;
+                _stage.Text = full ? "Полное стирание…" : "Быстрое стирание…";
+                Log(_stage.Text);
+                await Task.Run(() => Imapi.Erase(rec.Id, full, (elapsed, total) => BeginInvoke(() =>
+                {
+                    _progress.Value = total > 0 ? Math.Clamp(1000 * elapsed / total, 0, 1000) : 0;
+                    _stage.Text = $"{(full ? "Полное" : "Быстрое")} стирание: {elapsed} из ~{total} с";
+                })));
+                Log("Диск стёрт.");
+                _cancel.Enabled = true;
+            }
+
             string lastAction = "";
             await Task.Run(() => Imapi.Burn(rec.Id, _isoPath, speed, p => BeginInvoke(() =>
             {
@@ -263,7 +317,7 @@ internal sealed class BurnForm : Form
         _burn.Enabled = !busy;
         _cancel.Enabled = busy;
         _close.Enabled = !busy;
-        _recorder.Enabled = _refresh.Enabled = _speed.Enabled = _verify.Enabled = !busy;
+        _recorder.Enabled = _refresh.Enabled = _speed.Enabled = _erase.Enabled = _verify.Enabled = !busy;
         ControlBox = !busy;
     }
 

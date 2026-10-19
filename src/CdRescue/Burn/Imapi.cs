@@ -10,11 +10,17 @@ internal sealed record RecorderInfo(string Id, string Name, string Letters)
     public char? Letter => Letters.Length > 0 ? Letters[0] : null;
 }
 
+/// <param name="FreeSectors">Сколько поместится: на чистом диске - свободное место, на RW - вся ёмкость после стирания.</param>
 /// <param name="WriteSpeeds">Поддерживаемые скорости записи для вставленного диска, секторов в секунду.</param>
+/// <param name="NeedsErase">CD-RW или DVD-RW с данными: перед записью их нужно стереть.</param>
+/// <param name="Overwrite">DVD+RW, BD-RE, DVD-RAM с данными: запись идёт поверх, стирать не нужно.</param>
 internal sealed record MediaInfo(string Type, bool Supported, bool Blank, bool Appendable, long FreeSectors,
-    int SectorsPer1x, IReadOnlyList<int> WriteSpeeds, string Problem)
+    int SectorsPer1x, IReadOnlyList<int> WriteSpeeds, string Problem, bool NeedsErase = false, bool Overwrite = false)
 {
-    public bool CanBurn => Supported && Blank && Problem.Length == 0;
+    public bool CanBurn => Supported && Problem.Length == 0;
+
+    /// <summary>Запись уничтожит то, что сейчас на диске.</summary>
+    public bool DestroysData => NeedsErase || Overwrite;
 }
 
 internal readonly record struct BurnProgress(string Action, long Written, long Total, int RemainingSeconds);
@@ -27,6 +33,7 @@ internal readonly record struct BurnProgress(string Action, long Written, long T
 internal static class Imapi
 {
     // IMAPI_FORMAT2_DATA_MEDIA_STATE
+    private const int StateOverwriteOnly = 0x1;
     private const int StateBlank = 0x2;
     private const int StateAppendable = 0x4;
     private const int StateDamaged = 0x400;
@@ -116,14 +123,19 @@ internal static class Imapi
 
             int state = (int)fmt.CurrentMediaStatus;
             bool blank = (state & StateBlank) != 0;
+            bool erasable = type is 3 or 10;                                 // CD-RW, DVD-RW
+            bool overwrite = !blank && (state & StateOverwriteOnly) != 0;    // DVD+RW, BD-RE, DVD-RAM
+            bool needsErase = erasable && (!blank || (state & StateEraseRequired) != 0);
             string problem = (state & StateUnsupported) != 0 ? "диск не поддерживается"
-                : (state & StateDamaged) != 0 ? "диск повреждён"
+                : (state & StateDamaged) != 0 && !erasable ? "диск повреждён"
                 : (state & StateWriteProtected) != 0 ? "диск защищён от записи"
-                : (state & StateEraseRequired) != 0 ? "диск нужно стереть"
-                : (state & StateFinalized) != 0 || !blank ? "диск не пустой - нужна чистая болванка"
-                : "";
+                : blank || needsErase || overwrite ? ""
+                : "диск не пустой - нужна чистая болванка или перезаписываемый диск (RW)";
 
-            long free = blank ? (long)(int)fmt.FreeSectorsOnMedia : 0;
+            // На RW после стирания доступна вся ёмкость, а не остаток после старых сессий.
+            long free = blank && !needsErase ? (long)(int)fmt.FreeSectorsOnMedia
+                : needsErase || overwrite ? (long)(int)fmt.TotalSectorsOnMedia
+                : 0;
             var speeds = new List<int>();
             try
             {
@@ -136,7 +148,7 @@ internal static class Imapi
             }
 
             return new MediaInfo(typeName, true, blank, (state & StateAppendable) != 0, free, per1x,
-                speeds.Distinct().OrderByDescending(x => x).ToList(), problem);
+                speeds.Distinct().OrderByDescending(x => x).ToList(), problem, needsErase, overwrite);
         }
         finally
         {
@@ -145,7 +157,10 @@ internal static class Imapi
         }
     }
 
-    /// <summary>Пишет ISO на чистый диск и закрывает его. Блокирует поток до конца записи.</summary>
+    /// <summary>
+    /// Пишет ISO и закрывает диск. Чистый диск или DVD+RW/BD-RE (поверх старых данных);
+    /// CD-RW и DVD-RW перед этим нужно стереть. Блокирует поток до конца записи.
+    /// </summary>
     /// <param name="sectorsPerSecond">0 - максимальная скорость.</param>
     public static void Burn(string recorderId, string isoPath, int sectorsPerSecond,
         Action<BurnProgress> progress, CancellationToken ct)
@@ -200,6 +215,44 @@ internal static class Imapi
         }
     }
 
+    /// <summary>
+    /// Стирает CD-RW или DVD-RW. Быстрое стирание удаляет оглавление (около минуты), полное -
+    /// перезаписывает всю поверхность (десятки минут). Прервать стирание нельзя.
+    /// </summary>
+    /// <param name="progress">Прошло секунд и сколько всего ожидается.</param>
+    public static void Erase(string recorderId, bool full, Action<int, int> progress)
+    {
+        dynamic rec = Create("IMAPI2.MsftDiscRecorder2");
+        dynamic erase = Create("IMAPI2.MsftDiscFormat2Erase");
+        IConnectionPoint? cp = null;
+        int cookie = 0;
+        try
+        {
+            rec.InitializeDiscRecorder(recorderId);
+            erase.Recorder = rec;
+            erase.ClientName = "CdRescue";
+            erase.FullErase = full;
+
+            var container = (IConnectionPointContainer)(object)erase;
+            var iid = typeof(DDiscFormat2EraseEvents).GUID;
+            container.FindConnectionPoint(ref iid, out var point);
+            if (point is not null)
+            {
+                point.Advise(new EraseSink(progress), out cookie);
+                cp = point;
+            }
+
+            erase.EraseMedia();
+        }
+        finally
+        {
+            if (cp is not null && cookie != 0)
+                cp.Unadvise(cookie);
+            Release(erase);
+            Release(rec);
+        }
+    }
+
     private static dynamic Create(string progId) =>
         Activator.CreateInstance(Type.GetTypeFromProgID(progId, throwOnError: true)!)!;
 
@@ -222,6 +275,21 @@ internal static class Imapi
     {
         [DispId(0x200)]
         void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, [MarshalAs(UnmanagedType.IDispatch)] object args);
+    }
+
+    /// <summary>События стирания: прошло секунд и ожидаемая длительность.</summary>
+    [ComImport, Guid("2735413A-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    internal interface DDiscFormat2EraseEvents
+    {
+        [DispId(0x200)]
+        void Update([MarshalAs(UnmanagedType.IDispatch)] object sender, int elapsedSeconds, int estimatedTotalSeconds);
+    }
+
+    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+    private sealed class EraseSink(Action<int, int> report) : DDiscFormat2EraseEvents
+    {
+        public void Update(object sender, int elapsedSeconds, int estimatedTotalSeconds) =>
+            report(elapsedSeconds, estimatedTotalSeconds);
     }
 
     [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
